@@ -1,0 +1,6 @@
+Core_Trajopt/*
+Cost_Constraints/*
+a.py
+trajopt.py
+.vscode/*
+**/__pycache__/*
