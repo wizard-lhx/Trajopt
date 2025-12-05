@@ -8,7 +8,7 @@ from typing import List, Any
 from Kinematics.state_definitions import CAR_LENGTH
 from Environment.obstacles import OBSTACLES
 from utils.commom import get_car_corners, get_obstacle_corners
-from Cost_Constraints.no_collision_cost import compute_signed_distance_and_gradient
+from Cost_Constraints.no_collision_cost import compute_signed_distance
 
 # --- 可视化核心函数 (与上一步一致) ---
 def visualize_car(
@@ -153,10 +153,19 @@ def dynamic_visualization_test(initial_state, controls, obstacles):
             current_state = update_state(current_state, control_input)
             x_new, y_new, _ = current_state
 
-            # # 打印碰撞距离信息
-            # obs = OBSTACLES[1]  # 选择第一个障碍物
-            # sd, n_hat, pA_local, pB_world = compute_signed_distance_and_gradient(current_state, obs)
-            # print("Signed Distance:", sd)
+            # 打印碰撞距离信息
+            obs = OBSTACLES[1]  # 选择第一个障碍物
+            sd, n_hat, pA_local, pB_world = compute_signed_distance(current_state, obs)
+            theta = current_state[2]
+            rotation_matrix = np.array([
+                [np.cos(theta), -np.sin(theta)],
+                [np.sin(theta),  np.cos(theta)]
+            ])
+            pa_world = rotation_matrix @ pA_local + current_state[:2]
+            sd_compute = n_hat @ (pa_world - pB_world)
+            print("Signed Distance:", sd)
+            print("Computed SD:", sd_compute)
+            # print("Computed SD Check:", sd_compute)
             
             # 3. 绘制新状态和轨迹
             all_patches = visualize_car(current_state, ax)
