@@ -24,3 +24,5 @@ TrajOpt_2D_Car_Project/
 ├── README.md                       # 项目说明、依赖安装指南
 └── requirements.txt                # Python 依赖列表 (numpy, matplotlib, QP solver, etc.)
 ```
+# 问题
+无法实现2D的碰撞检测，所以先放弃了。

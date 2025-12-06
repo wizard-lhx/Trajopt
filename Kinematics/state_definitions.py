@@ -7,4 +7,5 @@ CONTROL_DIM = 2   # 控制量: [vx, omega]
 # --- 物理/仿真参数 ---
 CAR_WIDTH = 0.5   # 车子的宽度 (m)
 CAR_LENGTH = 1.0  # 车子的长度 (m)
-TIME_STEP = 0.05  # 仿真步长 DT (s)
+CAR_HEIGHT = 0.1  # 车子的高度 (m)
+TIME_STEP = 1./240.  # 仿真步长 DT (s)

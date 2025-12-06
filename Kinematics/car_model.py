@@ -2,7 +2,7 @@
 
 import numpy as np
 from typing import Tuple
-from Kinematics.state_definitions import TIME_STEP
+from Kinematics.state_definitions import TIME_STEP, CAR_WIDTH, CAR_LENGTH, CAR_HEIGHT
 
 def update_state(
     current_state: np.ndarray, 
@@ -86,24 +86,137 @@ def get_kinematics_jacobian(
     return J_x, J_u
 
 if __name__ == '__main__':
-    init_state = np.array([0.0, 0.0, 0.0])
-    control = np.array([1.0, np.pi * 2])
-
-    # 模型测试
-    print(update_state(init_state, control))
-
-    # 可视化测试
-    import utils.visualize
-    from matplotlib import pyplot as plt
-    fig, ax = plt.subplots(figsize=(10, 10))
-    ax.set_aspect('equal')
-    ax.grid(True)
-    ax.set_xlabel('X Position (m)')
-    ax.set_ylabel('Y Position (m)')
-    ax.set_xlim(-5, 10)
-    ax.set_ylim(-5, 10)
-    plt.ion()
-    fig.show()
-    utils.visualize.visualize_car(update_state(init_state, control), ax)
-    plt.ioff()
-    plt.show()
+    """
+    使用 PyBullet 测试和可视化运动学模型
+    """
+    import pybullet as p
+    import pybullet_data
+    import time
+    import math
+    
+    # 1. 初始化 PyBullet
+    p.connect(p.GUI)
+    p.setAdditionalSearchPath(pybullet_data.getDataPath())
+    p.setGravity(0, 0, -9.8)
+    
+    # 2. 加载地面
+    plane_id = p.loadURDF("plane.urdf")
+    
+    # 3. 创建车子模型 (长方体)
+    # 使用与 Kinematics 定义相同的尺寸    
+    col_shape_id = p.createCollisionShape(
+        p.GEOM_BOX, 
+        halfExtents=[CAR_LENGTH/2, CAR_WIDTH/2, CAR_HEIGHT/2]
+    )
+    vis_shape_id = p.createVisualShape(
+        p.GEOM_BOX, 
+        halfExtents=[CAR_LENGTH/2, CAR_WIDTH/2, CAR_HEIGHT/2], 
+        rgbaColor=[0, 0, 1, 1]
+    )
+    
+    car_id = p.createMultiBody(
+        baseMass=1,
+        baseCollisionShapeIndex=col_shape_id,
+        baseVisualShapeIndex=vis_shape_id,
+        basePosition=[0, 0, CAR_HEIGHT/2]
+    )
+    
+    # 设置摩擦系数
+    p.changeDynamics(car_id, -1, lateralFriction=0.5)
+    
+    # 4. 加载障碍物
+    from Environment.obstacles import OBSTACLES
+    obstacle_ids = []
+    for obs in OBSTACLES:
+        cx, cy, w, l, theta = obs
+        obs_col = p.createCollisionShape(
+            p.GEOM_BOX,
+            halfExtents=[l/2, w/2, 0.5]
+        )
+        obs_vis = p.createVisualShape(
+            p.GEOM_BOX,
+            halfExtents=[l/2, w/2, 0.5],
+            rgbaColor=[1, 0, 0, 0.5]
+        )
+        
+        # 将2D旋转角转换为四元数
+        orn = p.getQuaternionFromEuler([0, 0, theta])
+        obs_id = p.createMultiBody(
+            baseMass=0,  # 静态障碍物
+            baseCollisionShapeIndex=obs_col,
+            baseVisualShapeIndex=obs_vis,
+            basePosition=[cx, cy, 0.5],
+            baseOrientation=orn
+        )
+        obstacle_ids.append(obs_id)
+    
+    print("=== PyBullet 运动学模型测试 ===")
+    print("使用键盘控制:")
+    print("  UP/DOWN: 线速度 vx")
+    print("  LEFT/RIGHT: 角速度 omega")
+    print("  ESC: 退出")
+    print()
+    
+    # 启用碰撞检测和物理模拟
+    p.setRealTimeSimulation(0)  # 手动步进
+    
+    dt = TIME_STEP
+    
+    # 主循环
+    step_count = 0
+    while p.isConnected():
+        # 获取键盘输入
+        keys = p.getKeyboardEvents()
+        
+        vx = 0.0
+        omega = 0.0
+        
+        # 键盘控制
+        if p.B3G_UP_ARROW in keys and keys[p.B3G_UP_ARROW] & p.KEY_IS_DOWN:
+            vx = 1.0
+        if p.B3G_DOWN_ARROW in keys and keys[p.B3G_DOWN_ARROW] & p.KEY_IS_DOWN:
+            vx = -0.5
+        if p.B3G_LEFT_ARROW in keys and keys[p.B3G_LEFT_ARROW] & p.KEY_IS_DOWN:
+            omega = 1.0
+        if p.B3G_RIGHT_ARROW in keys and keys[p.B3G_RIGHT_ARROW] & p.KEY_IS_DOWN:
+            omega = -1.0
+        
+        # 从 PyBullet 获取当前状态（物理引擎计算的真实状态）
+        pos, orn = p.getBasePositionAndOrientation(car_id)
+        euler = p.getEulerFromQuaternion(orn)
+        current_theta = euler[2]
+        
+        # 计算全局坐标系下的速度
+        vx_global = vx * np.cos(current_theta)
+        vy_global = vx * np.sin(current_theta)
+        
+        # 使用速度控制而不是位置控制，让物理引擎处理碰撞
+        # 强制 z=0 平面运动和只绕 z 轴旋转
+        p.resetBaseVelocity(car_id, [vx_global, vy_global, 0], [0, 0, omega])
+        
+        # 同时约束车子高度，防止因碰撞被顶起
+        # p.resetBasePositionAndOrientation(
+        #     car_id,
+        #     [pos[0], pos[1], CAR_HEIGHT/2],  # 保持 z 高度恒定
+        #     p.getQuaternionFromEuler([0, 0, current_theta])  # 保持 roll=0, pitch=0
+        # )
+        
+        # 步进仿真
+        p.stepSimulation()
+        
+        # 相机跟随
+        p.resetDebugVisualizerCamera(
+            cameraDistance=5.0,
+            cameraYaw=math.degrees(current_theta) - 90,
+            cameraPitch=-45,
+            cameraTargetPosition=[pos[0], pos[1], 0]
+        )
+        
+        # 每秒打印一次状态
+        step_count += 1
+        if step_count % int(1.0/dt) == 0:
+            print(f"State: x={pos[0]:.2f}, y={pos[1]:.2f}, θ={np.degrees(current_theta):.1f}°")
+        
+        time.sleep(dt)
+    
+    p.disconnect()
