@@ -6,7 +6,7 @@ import numpy as np
 import time
 import pybullet as p
 from typing import Tuple, Optional
-
+from Kinematics.state_definitions import CAR_LENGTH, CAR_WIDTH, CAR_HEIGHT
 
 class BulletCollisionChecker:
     """
@@ -33,13 +33,13 @@ class BulletCollisionChecker:
         
         print(f"PyBullet collision checker initialized (client={self.physics_client})")
     
-    def create_car_body(self, car_length: float = 0.4, car_width: float = 0.2):
+    def create_car_body(self, car_length: float = CAR_LENGTH, car_width: float = CAR_WIDTH):
         """
         创建车辆碰撞体
         """
         col_shape = p.createCollisionShape(
             p.GEOM_BOX,
-            halfExtents=[car_length/2, car_width/2, 0.05],
+            halfExtents=[car_length/2, car_width/2, CAR_HEIGHT/2],
             physicsClientId=self.physics_client
         )
         
@@ -97,7 +97,7 @@ class BulletCollisionChecker:
         
         p.resetBasePositionAndOrientation(
             self.car_id,
-            [x, y, 0.05],
+            [x, y, CAR_HEIGHT/2],
             orn,
             physicsClientId=self.physics_client
         )
@@ -187,7 +187,7 @@ class BulletCollisionChecker:
         """
         清理资源
         """
-        time.sleep(60)  # 确保所有操作完成
+        # time.sleep(60)  # 测试时使用，观察GUI
         if self.physics_client >= 0:
             p.disconnect(physicsClientId=self.physics_client)
             self.physics_client = -1
