@@ -26,3 +26,4 @@ TrajOpt_2D_Car_Project/
 ```
 # 问题
 无法实现2D的碰撞检测，所以先放弃了。
+暂时没有用到penalty_utilities的松弛变量

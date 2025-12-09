@@ -31,8 +31,7 @@ D_SAFE = 0.1         # 安全距离
 
 def trajopt_sco_solver(
     trajectory_x_init: np.ndarray, 
-    goal_state: np.ndarray
-) -> Tuple[np.ndarray, np.ndarray, bool]:
+) -> Tuple[np.ndarray, bool]:
     """
     TrajOpt 的 SCO 主循环 (Algorithm 1)。
 
@@ -144,7 +143,7 @@ def trajopt_sco_solver(
             for constraint_idx, col_term in enumerate(col_approximations):
                 t = col_term['time_step']  # 时间步索引
                 gradient = col_term['gradient']  # ∇g(x) (shape: (STATE_DIM,))
-                offset = col_term['offset']  # g(x₀) - ∇g(x₀)·x₀
+                offset = col_term['initial_value']  # g(x₀) - ∇g(x₀)·x₀
                 
                 # 约束1: a·Δx - t ≤ -b  =>  ∇g·Δx - t ≤ -(g(x₀) - ∇g·x₀)
                 idx_start = t * N
@@ -179,7 +178,8 @@ def trajopt_sco_solver(
                 
                 # 求解 QP (获取增量 ΔX)
                 delta_X, success = solve_qp(H, c, s, None, None, A_ineq, b_ineq)
-                
+                assert success, "QP 求解失败"
+
                 # 计算模型预测的改进 (ModelImprove)
                 # ModelImprove = -(c^T * ΔX + 1/2 * ΔX^T * H * ΔX)
                 model_improve = -(c @ delta_X + 0.5 * delta_X @ H @ delta_X)
@@ -222,7 +222,7 @@ def trajopt_sco_solver(
             s = S_INITIAL # 重新初始化信赖域
         
     print("SCO Failure: Max iterations reached.")
-    return X_curr[:T*N].reshape(T,N), X_curr[T*N:].reshape(T-1, CONTROL_DIM), False
+    return X_curr[:T*N].reshape(T,N), False
 
 
 # --- 示例运行块 ---
@@ -237,10 +237,9 @@ if __name__ == '__main__':
     
     # 线性插值生成初始轨迹
     x_init = np.linspace(start, goal, T_steps)
-    u_init = np.zeros((T_steps - 1, CONTROL_DIM))
     
     # 2. 运行求解器
-    final_x, final_u, success = trajopt_sco_solver(x_init, u_init, goal)
+    final_x, success = trajopt_sco_solver(x_init)
     
     if success:
         print("\nOptimization Successful!")
