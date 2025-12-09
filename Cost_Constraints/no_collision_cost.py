@@ -27,7 +27,6 @@ def get_collision_checker() -> BulletCollisionChecker:
 
 def compute_signed_distance(
     car_state: np.ndarray, 
-    obs_data: np.ndarray,
     obs_id: int
 ) -> Tuple[float, np.ndarray, np.ndarray, np.ndarray]:
     """
@@ -48,7 +47,6 @@ def compute_signed_distance(
 
 def get_collision_penalty_gradient(
     car_state: np.ndarray, 
-    obs_data: np.ndarray,
     obs_id: int,
     d_safe: float = 0.1 
 ) -> np.ndarray:
@@ -57,7 +55,7 @@ def get_collision_penalty_gradient(
     这是 TrajOpt 构造 QP 子问题中碰撞约束项的关键。
     """
     
-    sd, n_hat, pA_local, pB_world = compute_signed_distance(car_state, obs_data, obs_id)
+    sd, n_hat, pA_local, pB_world = compute_signed_distance(car_state, obs_id)
     
     # 只有当 sd < d_safe 时，惩罚项才非零，才需要计算梯度
     if sd >= d_safe:
@@ -81,7 +79,7 @@ def get_collision_penalty_gradient(
     
     # 梯度公式: ∇_x sd(x) ≈ n_hat^T * J_pA(x)
     # 梯度的维度: 1 x 3
-    # 碰撞惩罚项的梯度: ∇_x |d_safe - sd(x)|+ = - ∇_x sd(x)
+    # 碰撞惩罚项的梯度: ∇_x (d_safe - sd(x)) = - ∇_x sd(x)
     
     collision_gradient = - n_hat @ J_pA
     
@@ -97,21 +95,21 @@ def linearize_all_collisions(car_trajectory: List[np.ndarray], d_safe: float = 0
     
     for t, state_t in enumerate(car_trajectory):
         for i, obs in enumerate(OBSTACLES):
-            gradient = get_collision_penalty_gradient(state_t, obs, i, d_safe)
+            gradient = get_collision_penalty_gradient(state_t, i, d_safe)
             
             # 如果梯度非零 (即发生碰撞或在 d_safe 范围内)
             if np.linalg.norm(gradient) > 1e-6:
                 # sd 在 d_safe 处的线性化近似为: sd(x) ≈ sd(x_t) + ∇sd * (x - x_t)
-                sd, _, _, _ = compute_signed_distance(state_t, obs, i)
+                sd, _, _, _ = compute_signed_distance(state_t, i)
                 
-                # 我们需要近似的是惩罚项 |d_safe - sd(x)|+
+                # 我们需要近似的是惩罚项 d_safe - sd(x)
                 
-                # 碰撞线性项: ∇_x |d_safe - sd(x)|+ * (x - x_t) + |d_safe - sd(x_t)|+
+                # 碰撞线性项: ∇_x (d_safe - sd(x)) * (x - x_t) + (d_safe - sd(x_t))
                 linear_term = {
                     'time_step': t,
                     'obstacle_id': i,
                     'gradient': gradient,
-                    'initial_value': np.max([0, d_safe - sd])
+                    'initial_value': d_safe - sd
                 }
                 collision_approximations.append(linear_term)
                 
@@ -132,11 +130,11 @@ if __name__ == "__main__":
     car_state1 = np.array([obs[0] - 0.3, obs[1], 0.0])
     print(f"\n测试1: 车辆状态 {car_state1}")
     
-    sd1, n_hat1, pA_local1, pB_world1 = compute_signed_distance(car_state1, obs, obs_id)
+    sd1, n_hat1, pA_local1, pB_world1 = compute_signed_distance(car_state1, obs_id)
     print(f"  Signed Distance: {sd1:.4f}")
     print(f"  Contact Normal: {n_hat1}")
     
-    gradient1 = get_collision_penalty_gradient(car_state1, obs, obs_id, d_safe=0.5)
+    gradient1 = get_collision_penalty_gradient(car_state1, obs_id, d_safe=0.5)
     print(f"  Collision Gradient: {gradient1}")
     
     # 测试线性化所有碰撞

@@ -22,47 +22,15 @@ K_PENALTY = 10.0     # k: 惩罚系数缩放因子
 MAX_ITER_PENALTY = 20
 MAX_ITER_CONVEXIFY = 100
 MAX_ITER_TRUST_REGION = 10
+XTOL = 1e-6          # xtol: 变量改进阈值
 FTOL = 1e-4          # ftol: Merit function 改进阈值
 CTOL = 1e-4          # ctol: 约束满足阈值
 D_SAFE = 0.1         # 安全距离
-
-
-# # --- 占位函数：求解二次规划 (QP Solver Placeholder) ---
-# def solve_qp(H, c, A_eq, b_eq, A_ineq, b_ineq, s_trust_region, M) -> np.ndarray:
-#     """
-#     【占位函数】模拟 QP 求解器。
-    
-#     TrajOpt 的 QP 子问题:
-#     min Δx  (1/2 * Δx^T * H * Δx + c^T * Δx)
-#     subject to: 线性约束, 信赖域约束 ||Δx|| <= s
-    
-#     由于我们没有集成 Gurobi/cvxpy，这里使用一个粗糙的占位符：
-#     如果初始轨迹不撞墙，就假设 QP 总是计算出沿着梯度方向的一个小步长。
-#     """
-#     # 模拟 QP 求解器返回的步长 Δx
-    
-#     # 在实际的 QP 中，Hessian H 是正定的，确保问题是凸的。
-#     # 我们用一个小的梯度下降步长来模拟 QP 的效果。
-    
-#     # 如果没有线性项，QP 解是 Δx = 0 (我们不希望这样)
-#     if np.linalg.norm(c) < 1e-6:
-#         return np.zeros(M)
-    
-#     # 模拟步长（反梯度方向，被信赖域约束）
-#     step_length = 0.1 # 假设的步长
-#     # 强制步长不超过信赖域
-#     step_length = min(step_length, s_trust_region)
-    
-#     # 沿着负梯度方向走
-#     delta_x = -c * step_length / np.linalg.norm(c)
-    
-#     return delta_x
 
 # --- 核心算法：Sequential Convex Optimization ---
 
 def trajopt_sco_solver(
     trajectory_x_init: np.ndarray, 
-    trajectory_u_init: np.ndarray,
     goal_state: np.ndarray
 ) -> Tuple[np.ndarray, np.ndarray, bool]:
     """
@@ -70,7 +38,6 @@ def trajopt_sco_solver(
 
     参数:
     trajectory_x_init: 初始状态轨迹 (T, STATE_DIM)。
-    trajectory_u_init: 初始控制轨迹 (T-1, CONTROL_DIM)。
     goal_state: 目标状态 (STATE_DIM)。
     
     返回:
@@ -78,59 +45,56 @@ def trajopt_sco_solver(
     """
     # 初始化变量
     x_curr = trajectory_x_init.copy()
-    u_curr = trajectory_u_init.copy()
     mu = MU_INITIAL
     s = S_INITIAL
     T = x_curr.shape[0]
     N = STATE_DIM
-    M = T * N + (T - 1) * CONTROL_DIM # 总优化变量维度
     
-    # 将所有变量堆叠成一个大向量 X (状态 x 和控制 u)
-    X_curr = np.hstack([x_curr.flatten(), u_curr.flatten()])
+    # 计算松弛变量数量：每个时间步 × 每个障碍物对应一个松弛变量
+    num_obstacles = len(OBSTACLES)
+    num_slack = T * num_obstacles  # 松弛变量总数
+    
+    M = T * N + num_slack  # 总优化变量维度 (状态 + 松弛变量)
+    
+    # 将所有变量堆叠成一个大向量 X = [x_0, ..., x_{T-1}, t_0, ..., t_{num_slack-1}]
+    # 其中 x 是状态，t 是松弛变量
+    slack_curr = np.zeros(num_slack)  # 初始化松弛变量为0
+    X_curr = np.hstack([x_curr.flatten(), slack_curr])
     
     # --- 辅助函数：计算当前 Merit Function 和约束违反程度 ---
     def calculate_current_violations(X_vector):
         x_flat = X_vector[:T * N]
-        u_flat = X_vector[T * N:]
+        slack_flat = X_vector[T * N:]  # 提取松弛变量
         x_traj = x_flat.reshape(T, N)
-        u_traj = u_flat.reshape(T - 1, CONTROL_DIM)
 
         # 1. 目标函数成本 (f_cost)
         diffs = x_traj[1:] - x_traj[:-1]
         f_cost = np.sum(diffs**2)
-
-        # 2. 运动学约束违反 (等式约束 h)
-        # 运动学约束 h = x_{t+1} - f(x_t, u_t)
-        kin_violations = []
-        for t in range(T - 1):
-            x_t_pred = update_state(x_traj[t], u_traj[t])
-            kin_violations.append(x_traj[t+1] - x_t_pred)
-        residual_eq = np.sum(np.abs(np.concatenate(kin_violations)))
+        
+        # 添加松弛变量的惩罚 (在QP中通过线性项 mu*t 实现)
+        # 这里只计算路径成本，松弛变量惩罚在 merit function 中体现
 
         # 3. 碰撞约束违反 (不等式约束 g)
-        # 碰撞约束: sd(x_t, obs) ≥ d_safe 对所有障碍物
-        # 违反量: max(0, d_safe - sd)
+        # 原始约束: sd(x_t, obs) ≥ d_safe
+        # 转换后: d_safe - sd(x_t, obs) ≤ t_{t,obs}
+        # 违反量: max(0, d_safe - sd - t)
         collision_violations = []
         for t in range(T):
-            for obs in OBSTACLES:
-                # 使用 compute_signed_distance_and_gradient 计算带符号距离
-                sd, _, _, _ = compute_signed_distance(x_traj[t], obs)
+            for i, obs in enumerate(OBSTACLES):
+                # 使用 compute_signed_distance 计算带符号距离
+                sd, _, _, _ = compute_signed_distance(x_traj[t], i)
                 
-                # 计算违反量 (铰链函数)
+                # 计算违反量 (考虑松弛变量)
                 violation = max(0, D_SAFE - sd)
                 collision_violations.append(violation)
         
         # 总碰撞违反量 (L1 范数)
         residual_ineq = np.sum(collision_violations)
+
+        # 等式约束违反 (h)
+        residual_eq = 0.0
         
-        # 4. 目标位姿约束 (x_T = goal_state)
-        goal_error = x_traj[-1] - goal_state
-        residual_goal = np.sum(np.abs(goal_error))
-        
-        # 综合等式违反
-        total_residual_eq = residual_eq + residual_goal
-        
-        return f_cost, residual_ineq, total_residual_eq
+        return f_cost, residual_ineq, residual_eq
 
     # 初始评估
     f_cost, residual_ineq, residual_eq = calculate_current_violations(X_curr)
@@ -142,7 +106,7 @@ def trajopt_sco_solver(
         # 检查是否满足约束
         if residual_ineq < CTOL and residual_eq < CTOL:
             print(f"SCO Success: Constraints satisfied (μ={mu:.2f})")
-            return X_curr[:T*N].reshape(T,N), X_curr[T*N:].reshape(T-1, CONTROL_DIM), True
+            return X_curr[:T*N].reshape(T,N), True
         
         print(f"\n--- PENALTY ITERATION {pen_iter + 1}: μ={mu:.2f}, s={s:.2f} ---")
         
@@ -154,72 +118,59 @@ def trajopt_sco_solver(
             # a. 目标函数 (路径长度) - 二次项 H 和线性项 c
             grad_path_state, H_path_state = linearize_and_quadraticize_path_cost(x_curr)
             
-            # 扩展梯度和 Hessian 到完整的优化变量维度 (包含控制)
-            # grad_path_state 只对状态有梯度 (T*N,)，控制部分梯度为 0
+            # 扩展梯度和 Hessian 到完整的优化变量维度 (包含松弛变量)
+            # grad_path_state 只对状态有梯度 (T*N,)，松弛变量部分梯度为 0
             grad_path = np.zeros(M)
             grad_path[:T*N] = grad_path_state  # 状态部分
-            # grad_path[T*N:] = 0  # 控制部分（已经是0）
+            # grad_path[T*N:] = 0  # 松弛变量部分（已经是0）
             
             # Hessian 也需要扩展
             H_path = np.zeros((M, M))
             H_path[:T*N, :T*N] = H_path_state  # 状态-状态块
-            # H_path[T*N:, T*N:] = 0  # 控制-控制块（已经是0）
+            # H_path[T*N:, T*N:] = 0  # 松弛变量-松弛变量块（已经是0）
             
-            # b. 碰撞惩罚项 (L1-ineq) - 线性近似和梯度
-            grad_col_penalty = np.zeros(M)
+            # b. 碰撞约束转换为松弛变量形式
+            # 将 |a·Δx + b|⁺ 转换为 QP: min μ·t, s.t. 0 ≤ t, a·Δx + b ≤ t
             col_approximations = linearize_all_collisions(x_curr, D_SAFE)
-            # 累加所有碰撞约束的梯度
-            for col_term in col_approximations:
+            
+            # 构建不等式约束矩阵 A_ineq 和向量 b_ineq
+            # 约束形式: A_ineq @ ΔX ≤ b_ineq
+            num_col_constraints = len(col_approximations)
+            # 每个碰撞约束生成2个不等式: (1) a·Δx - t ≤ -b  (2) -t ≤ 0
+            A_ineq = np.zeros((2 * num_col_constraints, M))
+            b_ineq = np.zeros(2 * num_col_constraints)
+            
+            slack_idx = 0
+            for constraint_idx, col_term in enumerate(col_approximations):
                 t = col_term['time_step']  # 时间步索引
-                gradient = col_term['gradient']  # 对应的梯度 (shape: (STATE_DIM,))
+                gradient = col_term['gradient']  # ∇g(x) (shape: (STATE_DIM,))
+                offset = col_term['offset']  # g(x₀) - ∇g(x₀)·x₀
                 
-                # 将该时间步的梯度累加到总梯度向量的对应位置
-                # 注意：grad_col_penalty 是针对整个轨迹的大向量 (shape: (M,))
-                # 其中前 T*N 个元素对应状态，后面对应控制
+                # 约束1: a·Δx - t ≤ -b  =>  ∇g·Δx - t ≤ -(g(x₀) - ∇g·x₀)
                 idx_start = t * N
                 idx_end = (t + 1) * N
-                grad_col_penalty[idx_start:idx_end] += gradient
-
-            # c. 运动学约束惩罚项 (L1-eq) - 线性近似和梯度
-            kin_constraints = linearize_all_kinematics(x_curr, u_curr)
-            grad_kin_penalty = np.zeros(M)
-            # 遍历所有运动学约束
-            for kin_term in kin_constraints:
-                t = kin_term['time_step']  # 时间步索引
-                A_lin = kin_term['A_lin']  # 雅可比矩阵 (N, 2N+U)
-                residual = kin_term['residual']  # 当前违反量 (N,)
+                A_ineq[2*constraint_idx, idx_start:idx_end] = gradient  # a·Δx 部分
+                A_ineq[2*constraint_idx, T*N + slack_idx] = -1.0  # -t 部分
+                b_ineq[2*constraint_idx] = -offset  # -b
                 
-                # L1 惩罚的次梯度：sign(residual)
-                sign_residual = np.sign(residual)  # (N,)
+                # 约束2: -t ≤ 0  (确保 t ≥ 0)
+                A_ineq[2*constraint_idx + 1, T*N + slack_idx] = -1.0
+                b_ineq[2*constraint_idx + 1] = 0.0
                 
-                # 梯度 = sign(h)ᵀ · J = (N,)ᵀ · (N, 2N+U) = (2N+U,)
-                local_grad = sign_residual @ A_lin  # shape: (2N+U,)
-                
-                # 将局部梯度放到大向量的对应位置
-                # A_lin 的列对应: [x_t (N维), u_t (U维), x_{t+1} (N维)]
-                
-                # x_t 的位置
-                idx_xt = t * N
-                grad_kin_penalty[idx_xt:idx_xt+N] += local_grad[:N]
-                
-                # u_t 的位置（在状态部分之后）
-                idx_ut = T * N + t * CONTROL_DIM
-                grad_kin_penalty[idx_ut:idx_ut+CONTROL_DIM] += local_grad[N:N+CONTROL_DIM]
-                
-                # x_{t+1} 的位置
-                idx_xt1 = (t + 1) * N
-                grad_kin_penalty[idx_xt1:idx_xt1+N] += local_grad[N+CONTROL_DIM:]
+                slack_idx += 1
             
-            # d. 综合 QP 目标项 (Hessian H 和梯度 c)
+            # c. 综合 QP 目标项 (Hessian H 和梯度 c)
             H = H_path  # 路径长度的 Hessian (M, M)
-            c = grad_path  # 路径长度的梯度 (M,)
+            c = grad_path.copy()  # 路径长度的梯度 (M,)
+            
+            # 添加松弛变量的线性惩罚项 μ·t
+            # 对每个松弛变量 t_i，目标函数添加 μ·t_i
+            c[T*N:] += mu  # 所有松弛变量的系数都是 μ
             
             # 验证维度
             assert H.shape == (M, M), f"Hessian 维度错误: {H.shape} != {(M, M)}"
             assert c.shape == (M,), f"梯度 c 维度错误: {c.shape} != {(M,)}"
-            
-            # 实际需要将 mu * 碰撞/运动学惩罚的线性化梯度加到 c 中
-            c += mu * (grad_col_penalty + grad_kin_penalty)
+            assert A_ineq.shape[1] == M, f"不等式约束维度错误: {A_ineq.shape[1]} != {M}"
             
             merit_old = compute_merit_function(f_cost, residual_ineq, residual_eq, mu)
             
@@ -227,7 +178,7 @@ def trajopt_sco_solver(
             for trust_iter in range(MAX_ITER_TRUST_REGION):
                 
                 # 求解 QP (获取增量 ΔX)
-                delta_X, success = solve_qp(H, c, s, None, None, None, None)
+                delta_X, success = solve_qp(H, c, s, None, None, A_ineq, b_ineq)
                 
                 # 计算模型预测的改进 (ModelImprove)
                 # ModelImprove = -(c^T * ΔX + 1/2 * ΔX^T * H * ΔX)
@@ -256,12 +207,12 @@ def trajopt_sco_solver(
                     print(f"  [{conv_iter}.{trust_iter}] Rejected. Ratio={ratio:.2f}, s={s:.2f}")
 
                 # 检查信赖域是否收缩到零 (可能陷入局部最优或终止)
-                if s < 1e-8:
+                if s < XTOL:
                     print("Trust region collapsed.")
                     break # 跳出 Trust Region 循环
             
             # 检查收敛 (基于 Merit Function 改进)
-            if true_improve < FTOL:
+            if true_improve < FTOL or np.linalg.norm(delta_X) < XTOL:
                 print(f"Convexify loop converged (Merit change < {FTOL})")
                 break # 跳出 Convexify 循环
         
