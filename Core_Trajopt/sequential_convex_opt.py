@@ -3,11 +3,9 @@
 import numpy as np
 from typing import Tuple
 # 导入模型和成本
-from Kinematics.state_definitions import STATE_DIM, CONTROL_DIM
-from Kinematics.car_model import update_state
+from Kinematics.state_definitions import STATE_DIM
 from Cost_Constraints.no_collision_cost import compute_signed_distance, linearize_all_collisions
 from Cost_Constraints.trajectory_cost import linearize_and_quadraticize_path_cost
-from Cost_Constraints.kinematics_constraint import linearize_all_kinematics
 from Cost_Constraints.trust_region import (
     compute_merit_function, evaluate_step, update_trust_region, 
     TAU_PLUS, TAU_MINUS, C_ACCEPT
@@ -49,41 +47,24 @@ def trajopt_sco_solver(
     T = x_curr.shape[0]
     N = STATE_DIM
     
-    # 计算松弛变量数量：每个时间步 × 每个障碍物对应一个松弛变量
-    num_obstacles = len(OBSTACLES)
-    num_slack = T * num_obstacles  # 松弛变量总数
-    
-    M = T * N + num_slack  # 总优化变量维度 (状态 + 松弛变量)
-    
-    # 将所有变量堆叠成一个大向量 X = [x_0, ..., x_{T-1}, t_0, ..., t_{num_slack-1}]
-    # 其中 x 是状态，t 是松弛变量
-    slack_curr = np.zeros(num_slack)  # 初始化松弛变量为0
-    X_curr = np.hstack([x_curr.flatten(), slack_curr])
+    # 注意：松弛变量数量在每次迭代时动态确定，取决于实际的碰撞约束数量
     
     # --- 辅助函数：计算当前 Merit Function 和约束违反程度 ---
-    def calculate_current_violations(X_vector):
-        x_flat = X_vector[:T * N]
-        slack_flat = X_vector[T * N:]  # 提取松弛变量
-        x_traj = x_flat.reshape(T, N)
-
+    def calculate_current_violations(x_traj):
         # 1. 目标函数成本 (f_cost)
         diffs = x_traj[1:] - x_traj[:-1]
         f_cost = np.sum(diffs**2)
-        
-        # 添加松弛变量的惩罚 (在QP中通过线性项 mu*t 实现)
-        # 这里只计算路径成本，松弛变量惩罚在 merit function 中体现
 
         # 3. 碰撞约束违反 (不等式约束 g)
         # 原始约束: sd(x_t, obs) ≥ d_safe
-        # 转换后: d_safe - sd(x_t, obs) ≤ t_{t,obs}
-        # 违反量: max(0, d_safe - sd - t)
+        # 违反量: max(0, d_safe - sd)
         collision_violations = []
         for t in range(T):
             for i, obs in enumerate(OBSTACLES):
                 # 使用 compute_signed_distance 计算带符号距离
                 sd, _, _, _ = compute_signed_distance(x_traj[t], i)
                 
-                # 计算违反量 (考虑松弛变量)
+                # 计算违反量（不考虑松弛变量，用于评估真实约束满足情况）
                 violation = max(0, D_SAFE - sd)
                 collision_violations.append(violation)
         
@@ -96,7 +77,7 @@ def trajopt_sco_solver(
         return f_cost, residual_ineq, residual_eq
 
     # 初始评估
-    f_cost, residual_ineq, residual_eq = calculate_current_violations(X_curr)
+    f_cost, residual_ineq, residual_eq = calculate_current_violations(x_curr)
     merit_old = compute_merit_function(f_cost, residual_ineq, residual_eq, mu)
     
     # --- 1. PenaltyIteration (外层循环：增加惩罚系数 μ) ---
@@ -105,7 +86,7 @@ def trajopt_sco_solver(
         # 检查是否满足约束
         if residual_ineq < CTOL and residual_eq < CTOL:
             print(f"SCO Success: Constraints satisfied (μ={mu:.2f})")
-            return X_curr[:T*N].reshape(T,N), True
+            return x_curr, True
         
         print(f"\n--- PENALTY ITERATION {pen_iter + 1}: μ={mu:.2f}, s={s:.2f} ---")
         
@@ -116,6 +97,18 @@ def trajopt_sco_solver(
             
             # a. 目标函数 (路径长度) - 二次项 H 和线性项 c
             grad_path_state, H_path_state = linearize_and_quadraticize_path_cost(x_curr)
+            
+            # b. 碰撞约束转换为松弛变量形式
+            # 将 |a·Δx + b|⁺ 转换为 QP: min μ·t, s.t. 0 ≤ t, a·Δx + b ≤ t
+            col_approximations = linearize_all_collisions(x_curr, D_SAFE)
+            
+            # 动态确定松弛变量数量（等于实际碰撞约束数量）
+            num_col_constraints = len(col_approximations)
+            num_slack = num_col_constraints  # 每个碰撞约束一个松弛变量
+            
+            M = T * N + num_slack  # 总优化变量维度 (状态 + 松弛变量)
+            
+            print(f"  [conv_iter={conv_iter}] Active collision constraints: {num_col_constraints}, total vars: {M}")
             
             # 扩展梯度和 Hessian 到完整的优化变量维度 (包含松弛变量)
             # grad_path_state 只对状态有梯度 (T*N,)，松弛变量部分梯度为 0
@@ -128,14 +121,9 @@ def trajopt_sco_solver(
             H_path[:T*N, :T*N] = H_path_state  # 状态-状态块
             # H_path[T*N:, T*N:] = 0  # 松弛变量-松弛变量块（已经是0）
             
-            # b. 碰撞约束转换为松弛变量形式
-            # 将 |a·Δx + b|⁺ 转换为 QP: min μ·t, s.t. 0 ≤ t, a·Δx + b ≤ t
-            col_approximations = linearize_all_collisions(x_curr, D_SAFE)
-            
             # 构建不等式约束矩阵 A_ineq 和向量 b_ineq
             # 约束形式: A_ineq @ ΔX ≤ b_ineq
-            num_col_constraints = len(col_approximations)
-            # 每个碰撞约束生成2个不等式: (1) a·Δx - t ≤ -b  (2) -t ≤ 0
+            # 每个碰撞约束生成2个不等式: (1) a·Δx - slack ≤ -b  (2) -slack ≤ 0
             A_ineq = np.zeros((2 * num_col_constraints, M))
             b_ineq = np.zeros(2 * num_col_constraints)
             
@@ -143,9 +131,9 @@ def trajopt_sco_solver(
             for constraint_idx, col_term in enumerate(col_approximations):
                 t = col_term['time_step']  # 时间步索引
                 gradient = col_term['gradient']  # ∇g(x) (shape: (STATE_DIM,))
-                offset = col_term['initial_value']  # g(x₀) - ∇g(x₀)·x₀
+                offset = col_term['initial_value']  # g(x₀)
                 
-                # 约束1: a·Δx - t ≤ -b  =>  ∇g·Δx - t ≤ -(g(x₀) - ∇g·x₀)
+                # 约束1: a·Δx - t ≤ -b  =>  ∇g·Δx - t ≤ -g(x₀)
                 idx_start = t * N
                 idx_end = (t + 1) * N
                 A_ineq[2*constraint_idx, idx_start:idx_end] = gradient  # a·Δx 部分
@@ -166,27 +154,82 @@ def trajopt_sco_solver(
             # 对每个松弛变量 t_i，目标函数添加 μ·t_i
             c[T*N:] += mu  # 所有松弛变量的系数都是 μ
             
+            # d. 添加起点和终点固定的等式约束
+            # 约束: Δx[0] = 0 (起点不动) 和 Δx[T-1] = 0 (终点不动)
+            # 总共 2 * N 个等式约束（起点N个，终点N个）
+            num_endpoint_constraints = 2 * N
+            A_eq = np.zeros((num_endpoint_constraints, M))
+            b_eq = np.zeros(num_endpoint_constraints)
+            
+            # 起点约束: Δx[0] = 0 => [x, y, theta] 在索引 0, 1, 2
+            for i in range(N):
+                A_eq[i, i] = 1.0
+                b_eq[i] = 0.0
+            
+            # 终点约束: Δx[T-1] = 0 => [x, y, theta] 在索引 (T-1)*N, (T-1)*N+1, (T-1)*N+2
+            for i in range(N):
+                A_eq[N + i, (T-1)*N + i] = 1.0
+                b_eq[N + i] = 0.0
+            
             # 验证维度
             assert H.shape == (M, M), f"Hessian 维度错误: {H.shape} != {(M, M)}"
             assert c.shape == (M,), f"梯度 c 维度错误: {c.shape} != {(M,)}"
             assert A_ineq.shape[1] == M, f"不等式约束维度错误: {A_ineq.shape[1]} != {M}"
+            assert A_eq.shape == (num_endpoint_constraints, M), f"等式约束维度错误: {A_eq.shape}"
             
             merit_old = compute_merit_function(f_cost, residual_ineq, residual_eq, mu)
             
             # --- 3. TrustRegionIteration (最内层循环：尝试步长) ---
             for trust_iter in range(MAX_ITER_TRUST_REGION):
                 
+                # ====== 记录QP求解器输入参数 ======
+                print(f"\n  === QP Call [{conv_iter}.{trust_iter}] ===")
+                print(f"  Trust region s = {s:.4f}")
+                # 调试信息（可选）
+                # print(f"  H shape: {H.shape}, norm: {np.linalg.norm(H):.4f}")
+                # print(f"  c shape: {c.shape}, norm: {np.linalg.norm(c):.4f}")
+                # print(f"  A_eq shape: {A_eq.shape}, rank: {np.linalg.matrix_rank(A_eq)} (endpoint constraints)")
+                # print(f"  b_eq: all zeros (fixing start and end points)")
+                # if A_ineq.size > 0:
+                #     print(f"  A_ineq shape: {A_ineq.shape}, rank: {np.linalg.matrix_rank(A_ineq)}")
+                #     print(f"  b_ineq shape: {b_ineq.shape}, min: {b_ineq.min():.4f}, max: {b_ineq.max():.4f}")
+                # else:
+                #     print(f"  A_ineq: empty (no collision constraints)")
+                #     A_ineq = None
+                #     b_ineq = None
+                
                 # 求解 QP (获取增量 ΔX)
-                delta_X, success = solve_qp(H, c, s, None, None, A_ineq, b_ineq)
-                assert success, "QP 求解失败"
+                # 传入 num_state=T*N，使信赖域约束只应用于状态变量
+                # 传入 A_eq, b_eq 确保起点和终点不变
+                delta_X, success = solve_qp(H, c, s, A_eq, b_eq, A_ineq, b_ineq, num_state=T*N)
+                
+                if not success:
+                    print(f"  QP FAILED!")
+                else:
+                    print(f"  QP SUCCESS: ||ΔX|| = {np.linalg.norm(delta_X):.4f}")
+                    # print(f"  Δx state norm: {np.linalg.norm(delta_X[:T*N]):.4f}")
+                    # print(f"  Δslack norm: {np.linalg.norm(delta_X[T*N:]):.4f}")
+                    # print(f"  slack values min/max: {delta_X[T*N:].min():.4f} / {delta_X[T*N:].max():.4f}")
+                # ====================================
+                
+                if not success:
+                    # QP求解失败，缩小信赖域重试
+                    s = s * TAU_MINUS
+                    print(f"  Shrinking trust region to s={s:.4f}")
+                    if s < XTOL:
+                        print(f"  Trust region too small, breaking")
+                        break
+                    continue  # 跳过本次迭代，用新的信赖域重试
 
                 # 计算模型预测的改进 (ModelImprove)
                 # ModelImprove = -(c^T * ΔX + 1/2 * ΔX^T * H * ΔX)
                 model_improve = -(c @ delta_X + 0.5 * delta_X @ H @ delta_X)
                 
-                # 尝试新解 X_new
-                X_new = X_curr + delta_X
-                f_cost_new, r_ineq_new, r_eq_new = calculate_current_violations(X_new)
+                # 尝试新解：只更新状态变量（松弛变量在每次迭代重新确定）
+                delta_x_state = delta_X[:T*N]
+                x_new = x_curr + delta_x_state.reshape(T, N)
+                
+                f_cost_new, r_ineq_new, r_eq_new = calculate_current_violations(x_new)
                 merit_new = compute_merit_function(f_cost_new, r_ineq_new, r_eq_new, mu)
                 
                 # 评估步长
@@ -196,7 +239,7 @@ def trajopt_sco_solver(
                 s_new, accepted = update_trust_region(s, ratio)
                 
                 if accepted:
-                    X_curr = X_new
+                    x_curr = x_new
                     s = s_new
                     f_cost, residual_ineq, residual_eq = f_cost_new, r_ineq_new, r_eq_new
                     merit_old = merit_new # 更新 Merit
@@ -222,7 +265,7 @@ def trajopt_sco_solver(
             s = S_INITIAL # 重新初始化信赖域
         
     print("SCO Failure: Max iterations reached.")
-    return X_curr[:T*N].reshape(T,N), False
+    return x_curr, False
 
 
 # --- 示例运行块 ---
@@ -245,8 +288,106 @@ if __name__ == '__main__':
         print("\nOptimization Successful!")
     else:
         print("\nOptimization Failed (Check constraints).")
-        
-    # 可视化最终轨迹 (需要运行 visualization.py 中的 dynamic_visualization_test)
-    # 简化：只打印结果
-    print(f"Final Path Length Cost: {linearize_and_quadraticize_path_cost(final_x)[0]}")
-    # print(final_x)
+    
+    # 3. 使用PyBullet可视化初始轨迹和最终轨迹
+    print("\n=== Starting PyBullet Visualization ===")
+    import pybullet as p
+    import time
+    from utils.bullet_collision import BulletCollisionChecker
+    
+    # 创建带GUI的碰撞检测器用于可视化
+    viz_checker = BulletCollisionChecker(use_gui=True)
+    
+    # 创建障碍物
+    for i, obs in enumerate(OBSTACLES):
+        cx, cy, w, l, theta = obs
+        viz_checker.create_obstacle(i, cx, cy, w, l, theta)
+    
+    # 创建车辆（将用于显示轨迹）
+    car_viz_id = viz_checker.create_car_body()
+    
+    # 设置相机视角
+    p.resetDebugVisualizerCamera(
+        cameraDistance=10,
+        cameraYaw=0,
+        cameraPitch=-45,
+        cameraTargetPosition=[2, 3, 0],
+        physicsClientId=viz_checker.physics_client
+    )
+    
+    print("\n显示初始轨迹（红色）...")
+    # 绘制初始轨迹（红色线）
+    initial_line_ids = []
+    for i in range(len(x_init) - 1):
+        line_id = p.addUserDebugLine(
+            [x_init[i][0], x_init[i][1], 0.1],
+            [x_init[i+1][0], x_init[i+1][1], 0.1],
+            lineColorRGB=[1, 0, 0],  # 红色
+            lineWidth=3,
+            physicsClientId=viz_checker.physics_client
+        )
+        initial_line_ids.append(line_id)
+    
+    # 绘制初始轨迹点
+    for i, state in enumerate(x_init):
+        p.addUserDebugText(
+            f"{i}",
+            [state[0], state[1], 0.3],
+            textColorRGB=[1, 0, 0],
+            textSize=0.8,
+            physicsClientId=viz_checker.physics_client
+        )
+    
+    time.sleep(2)
+    
+    print("显示最终轨迹（绿色）...")
+    # 绘制最终轨迹（绿色线）
+    final_line_ids = []
+    for i in range(len(final_x) - 1):
+        line_id = p.addUserDebugLine(
+            [final_x[i][0], final_x[i][1], 0.1],
+            [final_x[i+1][0], final_x[i+1][1], 0.1],
+            lineColorRGB=[0, 1, 0],  # 绿色
+            lineWidth=3,
+            physicsClientId=viz_checker.physics_client
+        )
+        final_line_ids.append(line_id)
+    
+    # 绘制最终轨迹点
+    for i, state in enumerate(final_x):
+        p.addUserDebugText(
+            f"{i}",
+            [state[0], state[1], 0.5],
+            textColorRGB=[0, 1, 0],
+            textSize=0.8,
+            physicsClientId=viz_checker.physics_client
+        )
+    
+    # 添加图例
+    p.addUserDebugText(
+        "红色 = 初始轨迹",
+        [-1, 7, 1],
+        textColorRGB=[1, 0, 0],
+        textSize=1.2,
+        physicsClientId=viz_checker.physics_client
+    )
+    p.addUserDebugText(
+        "绿色 = 优化后轨迹",
+        [-1, 6.5, 1],
+        textColorRGB=[0, 1, 0],
+        textSize=1.2,
+        physicsClientId=viz_checker.physics_client
+    )
+    
+    print("\n动画演示优化后的轨迹...")
+    # 动画演示最终轨迹
+    for i, state in enumerate(final_x):
+        # 更新车辆位置
+        viz_checker.update_car_pose(state)
+        time.sleep(1)
+    
+    print("\n可视化完成。按Enter键退出...")
+    input()
+    
+    # 清理
+    viz_checker.cleanup()

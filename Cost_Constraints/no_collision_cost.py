@@ -109,7 +109,7 @@ def linearize_all_collisions(car_trajectory: List[np.ndarray], d_safe: float = 0
                     'time_step': t,
                     'obstacle_id': i,
                     'gradient': gradient,
-                    'initial_value': d_safe - sd - gradient @ state_t
+                    'initial_value': d_safe - sd
                 }
                 collision_approximations.append(linear_term)
                 

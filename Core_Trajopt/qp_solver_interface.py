@@ -14,13 +14,14 @@ def solve_qp(
     A_eq: Optional[np.ndarray] = None, 
     b_eq: Optional[np.ndarray] = None, 
     A_ineq: Optional[np.ndarray] = None, 
-    b_ineq: Optional[np.ndarray] = None
+    b_ineq: Optional[np.ndarray] = None,
+    num_state: Optional[int] = None
 ) -> Tuple[Optional[np.ndarray], bool]:
     """
     使用 CVXPY 封装对二次规划 (QP) 求解器的调用。
 
     QP 形式: min Δx (1/2 * Δx^T * H * Δx + c^T * Δx)
-    约束:   ||Δx||_inf <= s_trust_region (信赖域)
+    约束:   ||Δx[:num_state]||_inf <= s_trust_region (信赖域，仅对状态变量)
              A_eq @ Δx == b_eq (可选的线性等式约束，例如运动学)
              A_ineq @ Δx <= b_ineq (可选的线性不等式约束，例如 L1 惩罚转换)
 
@@ -30,6 +31,7 @@ def solve_qp(
     s_trust_region (float): 信赖域大小。
     A_eq, b_eq (optional): 线性等式约束矩阵和向量。
     A_ineq, b_ineq (optional): 线性不等式约束矩阵和向量。
+    num_state (optional): 状态变量数量。如果提供，信赖域约束只应用于前num_state个变量。
 
     返回:
     Tuple[Optional[np.ndarray], bool]: 最优增量 Δx 和是否求解成功。
@@ -47,7 +49,14 @@ def solve_qp(
 
     # a. 信赖域约束 (Box/Infinity Norm Trust Region)
     # TrajOpt 通常使用 L-infinity 范数 (Box Constraint): ||Δx||_∞ <= s
-    constraints += [cp.abs(delta_x) <= s_trust_region]
+    # 如果指定了num_state，则信赖域约束只应用于状态变量
+    if num_state is not None and num_state < M:
+        # 只对状态变量应用信赖域约束
+        constraints += [cp.abs(delta_x[:num_state]) <= s_trust_region]
+    else:
+        # 对所有变量应用信赖域约束（向后兼容）
+        constraints += [cp.abs(delta_x) <= s_trust_region]
+    # constraints += [cp.abs(delta_x) <= s_trust_region]
     
     # b. 线性等式约束 (如硬运动学约束)
     if A_eq is not None and b_eq is not None:
