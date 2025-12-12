@@ -4,14 +4,14 @@ import numpy as np
 from typing import Tuple
 # 导入模型和成本
 from Kinematics.state_definitions import STATE_DIM
-from Cost_Constraints.no_collision_cost import compute_signed_distance, linearize_all_collisions
-from Cost_Constraints.trajectory_cost import linearize_and_quadraticize_path_cost
+from Cost_Constraints.no_collision_cost import compute_signed_distance
 from Cost_Constraints.trust_region import (
     compute_merit_function, evaluate_step, update_trust_region, 
     TAU_PLUS, TAU_MINUS, C_ACCEPT
 )
 from Environment.obstacles import OBSTACLES
 from Core_Trajopt.qp_solver_interface import solve_qp
+from Core_Trajopt.convexify import build_qp_subproblem
 
 # --- 算法参数 (Algorithm 1) ---
 MU_INITIAL = 1.0     # μ₀: 初始惩罚系数
@@ -93,89 +93,13 @@ def trajopt_sco_solver(
         # --- 2. ConvexifyIteration (内层循环：解决凸子问题) ---
         for conv_iter in range(MAX_ITER_CONVEXIFY):
             
-            # --- 构造 QP 子问题 (线性化和二次化) ---
+            # --- 构造 QP 子问题 (使用模块化的凸化函数) ---
+            H, c, A_eq, b_eq, A_ineq, b_ineq, M = build_qp_subproblem(
+                x_curr, T, N, D_SAFE, mu
+            )
             
-            # a. 目标函数 (路径长度) - 二次项 H 和线性项 c
-            grad_path_state, H_path_state = linearize_and_quadraticize_path_cost(x_curr)
-            
-            # b. 碰撞约束转换为松弛变量形式
-            # 将 |a·Δx + b|⁺ 转换为 QP: min μ·t, s.t. 0 ≤ t, a·Δx + b ≤ t
-            col_approximations = linearize_all_collisions(x_curr, D_SAFE)
-            
-            # 动态确定松弛变量数量（等于实际碰撞约束数量）
-            num_col_constraints = len(col_approximations)
-            num_slack = num_col_constraints  # 每个碰撞约束一个松弛变量
-            
-            M = T * N + num_slack  # 总优化变量维度 (状态 + 松弛变量)
-            
+            num_col_constraints = A_ineq.shape[0] // 2 if A_ineq.size > 0 else 0
             print(f"  [conv_iter={conv_iter}] Active collision constraints: {num_col_constraints}, total vars: {M}")
-            
-            # 扩展梯度和 Hessian 到完整的优化变量维度 (包含松弛变量)
-            # grad_path_state 只对状态有梯度 (T*N,)，松弛变量部分梯度为 0
-            grad_path = np.zeros(M)
-            grad_path[:T*N] = grad_path_state  # 状态部分
-            # grad_path[T*N:] = 0  # 松弛变量部分（已经是0）
-            
-            # Hessian 也需要扩展
-            H_path = np.zeros((M, M))
-            H_path[:T*N, :T*N] = H_path_state  # 状态-状态块
-            # H_path[T*N:, T*N:] = 0  # 松弛变量-松弛变量块（已经是0）
-            
-            # 构建不等式约束矩阵 A_ineq 和向量 b_ineq
-            # 约束形式: A_ineq @ ΔX ≤ b_ineq
-            # 每个碰撞约束生成2个不等式: (1) a·Δx - slack ≤ -b  (2) -slack ≤ 0
-            A_ineq = np.zeros((2 * num_col_constraints, M))
-            b_ineq = np.zeros(2 * num_col_constraints)
-            
-            slack_idx = 0
-            for constraint_idx, col_term in enumerate(col_approximations):
-                t = col_term['time_step']  # 时间步索引
-                gradient = col_term['gradient']  # ∇g(x) (shape: (STATE_DIM,))
-                offset = col_term['initial_value']  # g(x₀)
-                
-                # 约束1: a·Δx - t ≤ -b  =>  ∇g·Δx - t ≤ -g(x₀)
-                idx_start = t * N
-                idx_end = (t + 1) * N
-                A_ineq[2*constraint_idx, idx_start:idx_end] = gradient  # a·Δx 部分
-                A_ineq[2*constraint_idx, T*N + slack_idx] = -1.0  # -t 部分
-                b_ineq[2*constraint_idx] = -offset  # -b
-                
-                # 约束2: -t ≤ 0  (确保 t ≥ 0)
-                A_ineq[2*constraint_idx + 1, T*N + slack_idx] = -1.0
-                b_ineq[2*constraint_idx + 1] = 0.0
-                
-                slack_idx += 1
-            
-            # c. 综合 QP 目标项 (Hessian H 和梯度 c)
-            H = H_path  # 路径长度的 Hessian (M, M)
-            c = grad_path.copy()  # 路径长度的梯度 (M,)
-            
-            # 添加松弛变量的线性惩罚项 μ·t
-            # 对每个松弛变量 t_i，目标函数添加 μ·t_i
-            c[T*N:] += mu  # 所有松弛变量的系数都是 μ
-            
-            # d. 添加起点和终点固定的等式约束
-            # 约束: Δx[0] = 0 (起点不动) 和 Δx[T-1] = 0 (终点不动)
-            # 总共 2 * N 个等式约束（起点N个，终点N个）
-            num_endpoint_constraints = 2 * N
-            A_eq = np.zeros((num_endpoint_constraints, M))
-            b_eq = np.zeros(num_endpoint_constraints)
-            
-            # 起点约束: Δx[0] = 0 => [x, y, theta] 在索引 0, 1, 2
-            for i in range(N):
-                A_eq[i, i] = 1.0
-                b_eq[i] = 0.0
-            
-            # 终点约束: Δx[T-1] = 0 => [x, y, theta] 在索引 (T-1)*N, (T-1)*N+1, (T-1)*N+2
-            for i in range(N):
-                A_eq[N + i, (T-1)*N + i] = 1.0
-                b_eq[N + i] = 0.0
-            
-            # 验证维度
-            assert H.shape == (M, M), f"Hessian 维度错误: {H.shape} != {(M, M)}"
-            assert c.shape == (M,), f"梯度 c 维度错误: {c.shape} != {(M,)}"
-            assert A_ineq.shape[1] == M, f"不等式约束维度错误: {A_ineq.shape[1]} != {M}"
-            assert A_eq.shape == (num_endpoint_constraints, M), f"等式约束维度错误: {A_eq.shape}"
             
             merit_old = compute_merit_function(f_cost, residual_ineq, residual_eq, mu)
             
