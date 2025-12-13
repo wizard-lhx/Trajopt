@@ -28,17 +28,18 @@ D_SAFE = 0.1         # 安全距离
 # --- 核心算法：Sequential Convex Optimization ---
 
 def trajopt_sco_solver(
-    trajectory_x_init: np.ndarray, 
+    trajectory_x_init: np.ndarray,
+    use_continuous_collision: bool = False
 ) -> Tuple[np.ndarray, bool]:
     """
     TrajOpt 的 SCO 主循环 (Algorithm 1)。
 
     参数:
     trajectory_x_init: 初始状态轨迹 (T, STATE_DIM)。
-    goal_state: 目标状态 (STATE_DIM)。
+    use_continuous_collision: 是否使用连续时间碰撞检测（默认False使用离散碰撞检测）
     
     返回:
-    Tuple[final_x, final_u, success]: 最终轨迹和是否成功。
+    Tuple[final_x, success]: 最终轨迹和是否成功。
     """
     # 初始化变量
     x_curr = trajectory_x_init.copy()
@@ -95,7 +96,7 @@ def trajopt_sco_solver(
             
             # --- 构造 QP 子问题 (使用模块化的凸化函数) ---
             H, c, A_eq, b_eq, A_ineq, b_ineq, M = build_qp_subproblem(
-                x_curr, T, N, D_SAFE, mu
+                x_curr, T, N, D_SAFE, mu, use_continuous_collision=use_continuous_collision
             )
             
             num_col_constraints = A_ineq.shape[0] // 2 if A_ineq.size > 0 else 0

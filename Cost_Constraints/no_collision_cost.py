@@ -109,10 +109,71 @@ def linearize_all_collisions(car_trajectory: List[np.ndarray], d_safe: float = 0
                     'time_step': t,
                     'obstacle_id': i,
                     'gradient': gradient,
-                    'initial_value': d_safe - sd
+                    'initial_value': d_safe - sd,
+                    'type': 'discrete'  # 标记为离散碰撞
                 }
                 collision_approximations.append(linear_term)
                 
+    return collision_approximations
+
+
+def linearize_continuous_collisions(
+    car_trajectory: List[np.ndarray], 
+    d_safe: float = 0.1
+):
+    """
+    连续时间碰撞检测：检测相邻时间步之间swept volume凸包与障碍物的碰撞
+    
+    根据TrajOpt论文公式(23)，对每对相邻时间步(t, t+1)：
+    sd_AB(θ^t, θ^{t+1}) ≈ sd_AB(θ_0^t, θ_0^{t+1})
+                          + α * n̂^T * J_{p0}(θ_0^t) * (θ^t - θ_0^t)
+                          + (1-α) * n̂^T * J_{p1}(θ_0^{t+1}) * (θ^{t+1} - θ_0^{t+1})
+    
+    参数:
+        car_trajectory: 轨迹 (T, STATE_DIM)
+        d_safe: 安全距离
+    
+    返回:
+        collision_approximations: 线性化的连续碰撞约束列表
+    """
+    collision_approximations = []
+    T = len(car_trajectory)
+    checker = get_collision_checker()
+    
+    for t in range(T - 1):
+        state_t = car_trajectory[t]
+        state_t1 = car_trajectory[t + 1]
+        
+        for i, obs in enumerate(OBSTACLES):
+            # 使用PyBullet创建凸包并计算与障碍物的最近距离
+            sd_swept, n_hat, pA_local_t0, pB_world, alpha = checker.compute_swept_volume_distance(
+                state_t, state_t1, i, max_distance=d_safe + 0.2
+            )
+            
+            # 只在swept volume接近碰撞时添加约束
+            if sd_swept < d_safe + 0.1:
+                # 计算两个端点状态的梯度
+                grad_t = get_collision_penalty_gradient(state_t, i, d_safe)
+                grad_t1 = get_collision_penalty_gradient(state_t1, i, d_safe)
+                
+                # 根据alpha加权组合梯度
+                # 论文公式(23): (1-α)·∇sd_t + α·∇sd_{t+1}
+                gradient_combined = (1 - alpha) * grad_t + alpha * grad_t1
+                
+                if np.linalg.norm(gradient_combined) > 1e-6:
+                    linear_term = {
+                        'time_step': t,              # 起始时间步
+                        'time_step_end': t + 1,      # 结束时间步
+                        'obstacle_id': i,
+                        'gradient': gradient_combined,
+                        'gradient_t': grad_t,        # t时刻的梯度
+                        'gradient_t1': grad_t1,      # t+1时刻的梯度
+                        'alpha': alpha,              # 接触点的估计插值参数
+                        'initial_value': d_safe - sd_swept,  # 使用swept凸包的距离
+                        'type': 'continuous'         # 标记为连续碰撞
+                    }
+                    collision_approximations.append(linear_term)
+    
     return collision_approximations
 
 if __name__ == "__main__":

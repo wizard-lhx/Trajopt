@@ -5,7 +5,7 @@
 import numpy as np
 from typing import Tuple
 from Kinematics.state_definitions import STATE_DIM
-from Cost_Constraints.no_collision_cost import linearize_all_collisions
+from Cost_Constraints.no_collision_cost import linearize_all_collisions, linearize_continuous_collisions
 from Cost_Constraints.trajectory_cost import linearize_and_quadraticize_path_cost
 
 
@@ -53,7 +53,8 @@ def convexify_collision_constraints(
     x_curr: np.ndarray,
     d_safe: float,
     T: int,
-    N: int
+    N: int,
+    use_continuous: bool = False
 ) -> Tuple[np.ndarray, np.ndarray, int]:
     """
     将碰撞约束凸化为线性不等式约束（铰链损失 → 松弛变量）
@@ -66,14 +67,21 @@ def convexify_collision_constraints(
         d_safe: 安全距离
         T: 时间步数
         N: 状态维度
+        use_continuous: 是否使用连续时间碰撞检测
     
     返回:
         A_ineq: 不等式约束矩阵 (2*n_constraints, M)
         b_ineq: 不等式约束向量 (2*n_constraints,)
         num_slack: 松弛变量数量
     """
-    # 获取活跃的碰撞约束（线性化）
+    # 获取离散碰撞约束
     col_approximations = linearize_all_collisions(x_curr, d_safe)
+    
+    # 如果启用连续碰撞检测，添加连续约束
+    if use_continuous:
+        continuous_approximations = linearize_continuous_collisions(x_curr, d_safe)
+        col_approximations.extend(continuous_approximations)
+    
     num_col_constraints = len(col_approximations)
     num_slack = num_col_constraints  # 每个约束对应一个松弛变量
     
@@ -88,17 +96,34 @@ def convexify_collision_constraints(
         gradient = col_term['gradient']  # ∇g(x)
         offset = col_term['initial_value']  # g(x₀)
         
-        idx_start = t * N
-        idx_end = (t + 1) * N
-        slack_idx = constraint_idx
-        
-        # 约束1: ∇g·Δx - slack ≤ -g(x₀)
-        A_ineq[2*constraint_idx, idx_start:idx_end] = gradient
-        A_ineq[2*constraint_idx, T*N + slack_idx] = -1.0
-        b_ineq[2*constraint_idx] = -offset
+        # 对于连续碰撞，需要同时约束两个时间步
+        if col_term.get('type') == 'continuous':
+            t_end = col_term['time_step_end']
+            alpha = col_term['alpha']
+            grad_t = col_term['gradient_t']
+            grad_t1 = col_term['gradient_t1']
+            
+            # 约束1: α*∇g_t·Δx_t + (1-α)*∇g_{t+1}·Δx_{t+1} - slack ≤ -g(x₀)
+            idx_start_t = t * N
+            idx_end_t = (t + 1) * N
+            idx_start_t1 = t_end * N
+            idx_end_t1 = (t_end + 1) * N
+            
+            A_ineq[2*constraint_idx, idx_start_t:idx_end_t] = alpha * grad_t
+            A_ineq[2*constraint_idx, idx_start_t1:idx_end_t1] = (1 - alpha) * grad_t1
+            A_ineq[2*constraint_idx, T*N + constraint_idx] = -1.0
+            b_ineq[2*constraint_idx] = -offset
+        else:
+            # 离散碰撞：只约束单个时间步
+            idx_start = t * N
+            idx_end = (t + 1) * N
+            
+            A_ineq[2*constraint_idx, idx_start:idx_end] = gradient
+            A_ineq[2*constraint_idx, T*N + constraint_idx] = -1.0
+            b_ineq[2*constraint_idx] = -offset
         
         # 约束2: -slack ≤ 0 (确保 slack ≥ 0)
-        A_ineq[2*constraint_idx + 1, T*N + slack_idx] = -1.0
+        A_ineq[2*constraint_idx + 1, T*N + constraint_idx] = -1.0
         b_ineq[2*constraint_idx + 1] = 0.0
     
     return A_ineq, b_ineq, num_slack
@@ -147,7 +172,8 @@ def build_qp_subproblem(
     T: int,
     N: int,
     d_safe: float,
-    mu: float
+    mu: float,
+    use_continuous_collision: bool = False
 ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, int]:
     """
     构建完整的QP子问题
@@ -163,6 +189,7 @@ def build_qp_subproblem(
         N: 状态维度
         d_safe: 安全距离
         mu: 惩罚系数
+        use_continuous_collision: 是否使用连续时间碰撞检测（默认False）
     
     返回:
         H: Hessian矩阵
@@ -174,7 +201,9 @@ def build_qp_subproblem(
         M: 总变量维度
     """
     # 1. 凸化碰撞约束（确定松弛变量数量）
-    A_ineq, b_ineq, num_slack = convexify_collision_constraints(x_curr, d_safe, T, N)
+    A_ineq, b_ineq, num_slack = convexify_collision_constraints(
+        x_curr, d_safe, T, N, use_continuous=use_continuous_collision
+    )
     
     # 2. 凸化目标函数
     H, c = convexify_objective(x_curr, T, N, num_slack, mu)
