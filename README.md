@@ -28,8 +28,8 @@ TrajOpt_2D_Car_Project/
 
 # 问题
 当前没有对论文中连续时间的碰撞进行检测造成两个离散状态之间插值可能会出现碰撞或者两个状态之间直接穿过障碍物，在dev分支有未完成的连续碰撞检测。
-![两个离散状态之间插值可能会出现碰撞](videos/离散trajopt.webm)
-![两个离散状态之间直接穿过障碍物](videos/离散trajopt.webm)
+[两个离散状态之间插值可能会出现碰撞](videos/离散trajopt.webm)
+[两个离散状态之间直接穿过障碍物](videos/离散trajopt.webm)
 - 修复凸化时用到的变量
 - 只对delta_x应用置信域
 - A_ineq 类型为 None 判断
