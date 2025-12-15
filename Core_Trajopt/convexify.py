@@ -80,8 +80,11 @@ def convexify_collision_constraints(
     M = T * N + num_slack
     
     # 每个碰撞约束生成2个不等式
-    A_ineq = np.zeros((2 * num_col_constraints, M))
-    b_ineq = np.zeros(2 * num_col_constraints)
+    if num_col_constraints == 0:
+        return None, None, 0
+    else:
+        A_ineq = np.zeros((2 * num_col_constraints, M))
+        b_ineq = np.zeros(2 * num_col_constraints)
     
     for constraint_idx, col_term in enumerate(col_approximations):
         t = col_term['time_step']

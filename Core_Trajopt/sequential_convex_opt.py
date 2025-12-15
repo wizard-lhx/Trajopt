@@ -98,7 +98,10 @@ def trajopt_sco_solver(
                 x_curr, T, N, D_SAFE, mu
             )
             
-            num_col_constraints = A_ineq.shape[0] // 2 if A_ineq.size > 0 else 0
+            if A_ineq is not None:
+                num_col_constraints = A_ineq.shape[0] // 2 if A_ineq.size > 0 else 0
+            else:
+                num_col_constraints = 0
             print(f"  [conv_iter={conv_iter}] Active collision constraints: {num_col_constraints}, total vars: {M}")
             
             merit_old = compute_merit_function(f_cost, residual_ineq, residual_eq, mu)
